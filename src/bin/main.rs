@@ -7,9 +7,24 @@ use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Level, OutputOpenDrain, Pull};
 use esp_hal::main;
+use esp_hal::rng::Rng;
+use esp_hal::timer::timg::TimerGroup;
+use esp_wifi::wifi::{
+    AuthMethod, ClientConfiguration, Configuration, WifiController, WifiDevice, WifiStaDevice,
+};
+use esp_wifi::{init, EspWifiController};
 use log::info;
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::socket::dhcpv4;
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
+use static_cell::StaticCell;
 
 extern crate alloc;
+
+// --- WiFi credentials ---
+const WIFI_SSID: &str = env!("WIFI_SSID");
+const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 
 #[derive(Debug)]
 enum DhtError {
@@ -113,6 +128,73 @@ fn read_byte(sensor: &OutputOpenDrain, delay: &mut Delay) -> Result<u8, DhtError
     Ok(byte)
 }
 
+// ─── WiFi + smoltcp ───────────────────────────────────────────────────────────
+/// Block until the WiFi controller has joined the AP.
+fn connect_wifi(controller: &mut WifiController<'_>, delay: &mut Delay) {
+    info!("Connecting to WiFi SSID: {}", WIFI_SSID);
+
+    let client_config = Configuration::Client(ClientConfiguration {
+        ssid: WIFI_SSID.try_into().unwrap(),
+        password: WIFI_PASSWORD.try_into().unwrap(),
+        auth_method: AuthMethod::WPA2Personal,
+        ..Default::default()
+    });
+
+    controller.set_configuration(&client_config).unwrap();
+    controller.start().unwrap();
+
+    loop {
+        match controller.connect() {
+            Ok(_) => break,
+            Err(e) => {
+                info!("WiFi connect error: {:?}, retrying...", e);
+                delay.delay_millis(1000);
+            }
+        }
+    }
+
+    loop {
+        if matches!(controller.is_connected(), Ok(true)) {
+            break;
+        }
+        delay.delay_millis(200);
+    }
+
+    info!("WiFi connected!");
+}
+
+/// Run a smoltcp poll loop until DHCP assigns an IP address.
+/// Returns the assigned IPv4 address.
+fn acquire_ip(
+    iface: &mut Interface,
+    device: &mut WifiDevice<'_, WifiStaDevice>,
+    sockets: &mut SocketSet<'_>,
+    dhcp_handle: smoltcp::iface::SocketHandle,
+    delay: &mut Delay,
+) -> Ipv4Address {
+    info!("Waiting for DHCP lease...");
+    loop {
+        let timestamp = Instant::from_millis(0); // monotonic tick not needed for DHCP acquire
+        iface.poll(timestamp, device, sockets);
+
+        let dhcp_socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
+        if let Some(dhcpv4::Event::Configured(config)) = dhcp_socket.poll() {
+            info!("DHCP configured: {}", config.address);
+            iface.update_ip_addrs(|addrs| {
+                addrs.clear();
+                addrs.push(IpCidr::Ipv4(config.address)).unwrap();
+            });
+            if let Some(router) = config.router {
+                iface.routes_mut().add_default_ipv4_route(router).unwrap();
+                info!("Default gateway: {}", router);
+            }
+            return config.address.address();
+        }
+
+        delay.delay_millis(10);
+    }
+}
+
 #[main]
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -121,8 +203,40 @@ fn main() -> ! {
     esp_println::logger::init_logger_from_env();
     esp_alloc::heap_allocator!(72 * 1024);
 
-    let mut sensor = OutputOpenDrain::new(peripherals.GPIO48, Level::High, Pull::None);
     let mut delay = Delay::new();
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let rng = Rng::new(peripherals.RNG);
+    let radio_clocks = peripherals.RADIO_CLK;
+
+    static WIFI_CTRL: StaticCell<EspWifiController<'static>> = StaticCell::new();
+    let esp_wifi_ctrl = WIFI_CTRL.init(init(timg0.timer0, rng.clone(), radio_clocks).unwrap());
+
+    let (mut wifi_device, mut controller) =
+        esp_wifi::wifi::new_with_mode(esp_wifi_ctrl, peripherals.WIFI, WifiStaDevice).unwrap();
+
+    connect_wifi(&mut controller, &mut delay);
+    let mac = wifi_device.mac_address();
+    let ethernet_addr = EthernetAddress(mac);
+    let iface_config = Config::new(ethernet_addr.into());
+    let mut iface = Interface::new(iface_config, &mut wifi_device, Instant::from_millis(0));
+
+    let dhcp_socket = dhcpv4::Socket::new();
+    let mut socket_storage = [smoltcp::iface::SocketStorage::EMPTY; 2];
+    let mut sockets = SocketSet::new(&mut socket_storage[..]);
+    let dhcp_handle = sockets.add(dhcp_socket);
+
+    let ip = acquire_ip(
+        &mut iface,
+        &mut wifi_device,
+        &mut sockets,
+        dhcp_handle,
+        &mut delay,
+    );
+
+    info!("Network ready. IP: {}", ip);
+
+    let mut sensor = OutputOpenDrain::new(peripherals.GPIO48, Level::High, Pull::None);
 
     info!("DHT22 sensor online");
     info!("reading...");
@@ -134,5 +248,9 @@ fn main() -> ! {
             Ok(_) => {}
             Err(e) => info!("Reading failed: {:?}", e),
         }
+
+        // Keep the WiFi stack alive
+        let timestamp = Instant::from_millis(0);
+        iface.poll(timestamp, &mut wifi_device, &mut sockets);
     }
 }
