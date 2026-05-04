@@ -17,7 +17,7 @@ use log::info;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpCidr};
 use static_cell::StaticCell;
 
 extern crate alloc;
@@ -32,36 +32,34 @@ enum DhtError {
     ChecksumError,
 }
 
-// DHT22 Sequence (each reading):
-//
-// MCU sends start signal (18ms low, then high)
-// Sensor acknowledges (80μs low, then 80μs high)
-// Sensor sends 40 bits of data (5 bytes total):
-//
-// Humidity high byte (8 bits)
-// Humidity low byte (8 bits)
-// Temperature high byte (8 bits)
-// Temperature low byte (8 bits)
-// Checksum byte (8 bits)
-//
-// Sensor goes idle until next reading
-//
-// Each bit transmission:
-//
-// 50μs low (start of bit)
-// 26-28μs high = bit 0
-// 70μs    high = bit 1
+/// DHT22 Sequence (each reading):
+///
+/// MCU sends start signal (18ms low, then high)
+/// Sensor acknowledges (80μs low, then 80μs high)
+/// Sensor sends 40 bits of data (5 bytes total):
+///
+/// Humidity high byte (8 bits)
+/// Humidity low byte (8 bits)
+/// Temperature high byte (8 bits)
+/// Temperature low byte (8 bits)
+/// Checksum byte (8 bits)
+///
+/// Sensor goes idle until next reading
+///
+/// Each bit transmission:
+///
+/// 50μs low (start of bit)
+/// 26-28μs high = bit 0
+/// 70μs    high = bit 1
 fn read_sensor(sensor: &mut OutputOpenDrain, delay: &mut Delay) -> Result<(), DhtError> {
     sensor.set_low();
     delay.delay_millis(18);
     sensor.set_high();
     delay.delay_micros(48);
 
-    // Sync with sensor
     wait_for_state(&*sensor, PinState::High, delay)?;
     wait_for_state(&*sensor, PinState::Low, delay)?;
 
-    // Start reading 40 bits (5 bytes)
     let humidity_high = read_byte(&*sensor, delay)?;
     let humidity_low = read_byte(&*sensor, delay)?;
     let temperature_high = read_byte(&*sensor, delay)?;
@@ -98,16 +96,12 @@ fn wait_for_state(
     state: PinState,
     delay: &mut Delay,
 ) -> Result<(), DhtError> {
+    let target = matches!(state, PinState::High);
     for _ in 0..10_000 {
-        let desired_pin_state = match state {
-            PinState::Low => sensor.is_low(),
-            PinState::High => sensor.is_high(),
-        };
-
-        match desired_pin_state {
-            true => return Ok(()),
-            false => delay.delay_micros(1),
+        if sensor.is_high() == target {
+            return Ok(());
         }
+        delay.delay_micros(1);
     }
     Err(DhtError::Timeout)
 }
@@ -118,10 +112,8 @@ fn read_byte(sensor: &OutputOpenDrain, delay: &mut Delay) -> Result<u8, DhtError
         wait_for_state(sensor, PinState::High, delay)?;
         delay.delay_micros(30);
 
-        let is_bit_1 = sensor.is_high();
-        if is_bit_1 {
-            let bit_mask = 1 << (7 - (n % 8));
-            byte |= bit_mask;
+        if sensor.is_high() {
+            byte |= 1 << (7 - n);
         }
         wait_for_state(sensor, PinState::Low, delay)?;
     }
@@ -144,16 +136,11 @@ fn connect_wifi(controller: &mut WifiController<'_>, delay: &mut Delay) {
     controller.start().unwrap();
 
     loop {
-        match controller.connect() {
-            Ok(_) => break,
-            Err(e) => {
-                info!("WiFi connect error: {:?}, retrying...", e);
-                delay.delay_millis(1000);
-            }
+        if let Err(e) = controller.connect() {
+            info!("WiFi connect error: {:?}, retrying...", e);
+            delay.delay_millis(1000);
+            continue;
         }
-    }
-
-    loop {
         if matches!(controller.is_connected(), Ok(true)) {
             break;
         }
@@ -164,18 +151,16 @@ fn connect_wifi(controller: &mut WifiController<'_>, delay: &mut Delay) {
 }
 
 /// Run a smoltcp poll loop until DHCP assigns an IP address.
-/// Returns the assigned IPv4 address.
 fn acquire_ip(
     iface: &mut Interface,
     device: &mut WifiDevice<'_, WifiStaDevice>,
     sockets: &mut SocketSet<'_>,
     dhcp_handle: smoltcp::iface::SocketHandle,
     delay: &mut Delay,
-) -> Ipv4Address {
+) {
     info!("Waiting for DHCP lease...");
     loop {
-        let timestamp = Instant::from_millis(0); // monotonic tick not needed for DHCP acquire
-        iface.poll(timestamp, device, sockets);
+        iface.poll(Instant::from_millis(0), device, sockets);
 
         let dhcp_socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
         if let Some(dhcpv4::Event::Configured(config)) = dhcp_socket.poll() {
@@ -188,7 +173,7 @@ fn acquire_ip(
                 iface.routes_mut().add_default_ipv4_route(router).unwrap();
                 info!("Default gateway: {}", router);
             }
-            return config.address.address();
+            return;
         }
 
         delay.delay_millis(10);
@@ -226,15 +211,13 @@ fn main() -> ! {
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
     let dhcp_handle = sockets.add(dhcp_socket);
 
-    let ip = acquire_ip(
+    acquire_ip(
         &mut iface,
         &mut wifi_device,
         &mut sockets,
         dhcp_handle,
         &mut delay,
     );
-
-    info!("Network ready. IP: {}", ip);
 
     let mut sensor = OutputOpenDrain::new(peripherals.GPIO48, Level::High, Pull::None);
 
