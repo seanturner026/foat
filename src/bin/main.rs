@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::digital::PinState;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
@@ -57,14 +56,14 @@ fn read_sensor(sensor: &mut OutputOpenDrain, delay: &mut Delay) -> Result<(), Dh
     sensor.set_high();
     delay.delay_micros(48);
 
-    wait_for_state(&*sensor, PinState::High, delay)?;
-    wait_for_state(&*sensor, PinState::Low, delay)?;
+    wait_for_state(sensor, true, delay)?;
+    wait_for_state(sensor, false, delay)?;
 
-    let humidity_high = read_byte(&*sensor, delay)?;
-    let humidity_low = read_byte(&*sensor, delay)?;
-    let temperature_high = read_byte(&*sensor, delay)?;
-    let temperature_low = read_byte(&*sensor, delay)?;
-    let checksum = read_byte(&*sensor, delay)?;
+    let humidity_high = read_byte(sensor, delay)?;
+    let humidity_low = read_byte(sensor, delay)?;
+    let temperature_high = read_byte(sensor, delay)?;
+    let temperature_low = read_byte(sensor, delay)?;
+    let checksum = read_byte(sensor, delay)?;
 
     // humidity
     let humidity_value = ((humidity_high as u16) << 8) | (humidity_low as u16);
@@ -93,12 +92,11 @@ fn read_sensor(sensor: &mut OutputOpenDrain, delay: &mut Delay) -> Result<(), Dh
 
 fn wait_for_state(
     sensor: &OutputOpenDrain,
-    state: PinState,
+    high: bool,
     delay: &mut Delay,
 ) -> Result<(), DhtError> {
-    let target = matches!(state, PinState::High);
     for _ in 0..10_000 {
-        if sensor.is_high() == target {
+        if sensor.is_high() == high {
             return Ok(());
         }
         delay.delay_micros(1);
@@ -109,13 +107,13 @@ fn wait_for_state(
 fn read_byte(sensor: &OutputOpenDrain, delay: &mut Delay) -> Result<u8, DhtError> {
     let mut byte: u8 = 0;
     for n in 0..8 {
-        wait_for_state(sensor, PinState::High, delay)?;
+        wait_for_state(sensor, true, delay)?;
         delay.delay_micros(30);
 
         if sensor.is_high() {
             byte |= 1 << (7 - n);
         }
-        wait_for_state(sensor, PinState::Low, delay)?;
+        wait_for_state(sensor, false, delay)?;
     }
     Ok(byte)
 }
