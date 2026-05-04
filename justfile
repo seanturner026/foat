@@ -1,10 +1,15 @@
 _default:
-  @just --list
+  just --list --alias-style left --list-heading ''
 
+set quiet
 set dotenv-load
 set dotenv-path := ".env"
 
+# firmware
+# ─────────────────────────────────────────────────────────────────────────────
+
 alias r := run
-[doc('use cargo to flash and run the execution loop')]
+[doc('flash the firmware and stream the serial monitor')]
+[group('firmware')]
 run:
-  @cargo run
+  cargo run
